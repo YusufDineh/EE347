@@ -536,11 +536,17 @@ def inverse_kinematics(x_target: float, y_target: float, z_target: float,
         ori_err = orientation_error(q_all, rx_d, ry_d, rz_d)
         return np.concatenate([pos_err * pos_weight, ori_err * ori_weight])
     
-    # Use trust region reflective method for better non-linear handling
+    # Extract bounds from JOINT_LIMITS
+    lower_bounds = np.array([limit[0] for limit in JOINT_LIMITS])
+    upper_bounds = np.array([limit[1] for limit in JOINT_LIMITS])
+    bounds = (lower_bounds, upper_bounds)
+    
+    # Use trust region reflective method for better non-linear handling with bounds
     result = least_squares(
         combined_residual, 
         q_init,
-        method='trf',
+        bounds=bounds,  # Apply joint angle limits as bounds
+        method='trf',   # 'trf' supports bounds
         max_nfev=max_iterations,
         ftol=tolerance,
         xtol=tolerance,
