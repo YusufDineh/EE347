@@ -279,26 +279,27 @@ def init_robot(dry_run: bool = False) -> bool:
         mc = MyCobot(PI_PORT, PI_BAUD)
         mc.power_on()
         time.sleep(1.0)
-        
+
         logging.info("Robot connected and powered on")
-        
+
         # Verify robot status
         if not verify_robot_status():
             logging.error("Robot status verification failed")
             return False
-        
-        # Query actual joint limits from robot
-        JOINT_LIMITS = get_robot_joint_limits()
-        
+
+        # NOTE: Do NOT overwrite the hard-coded JOINT_LIMITS below.
+        # Keep the fixed joint limits defined in the script for safety.
+        logging.debug("Using fixed JOINT_LIMITS from script; not querying robot for limits.")
+
         # Setup spacebar control
         setup_spacebar_control()
-        
+
         # Clear any existing errors
         check_robot_errors()
-        
+
         logging.info("Robot initialization complete")
         return True
-        
+
     except Exception as e:
         logging.error(f"Failed to initialize robot: {e}")
         return False
@@ -596,7 +597,7 @@ def control_gripper(value: int, sleep_time: float = GRIPPER_SLEEP) -> bool:
         # Clamp value to valid range
         value = max(0, min(100, int(value)))
         
-        mc.send_gripper_value(value)
+        mc.set_gripper_state(value, 70)
         time.sleep(sleep_time)
         
         action = "CLOSED" if value > 50 else "OPEN"
@@ -611,6 +612,38 @@ def control_gripper(value: int, sleep_time: float = GRIPPER_SLEEP) -> bool:
         logging.error(f"Failed to control gripper: {e}")
         check_robot_errors()
         return False
+
+
+def set_gripper_state(state: int, value: Optional[int] = None) -> bool:
+    """
+    Set gripper state using a simple 0=open, 1=close interface.
+
+    Args:
+        state: 0 => open, 1 => close
+        value: Optional numeric gripper value (0-100). If provided, this value
+               will be sent to the gripper instead of the configured defaults.
+
+    Returns:
+        True if gripper action succeeded, False otherwise
+    """
+    try:
+        state_int = int(state)
+    except Exception:
+        logging.error("Invalid gripper state (must be 0=open or 1=close)")
+        return False
+
+    if state_int not in (0, 1):
+        logging.error("Invalid gripper state (must be 0=open or 1=close)")
+        return False
+
+    # Use provided numeric value if given, otherwise use defaults
+    if value is not None:
+        return control_gripper(int(value), sleep_time=GRIPPER_SLEEP)
+
+    if state_int == 0:
+        return control_gripper(GRIPPER_OPEN, sleep_time=GRIPPER_SLEEP)
+    else:
+        return control_gripper(GRIPPER_CLOSE, sleep_time=GRIPPER_SLEEP)
 
 
 def get_current_positions() -> Tuple[Optional[List[float]], Optional[List[float]]]:
@@ -841,7 +874,8 @@ def pick_and_place_sequence(positions: List[Tuple[int, List[float]]],
     
     # Start with gripper open
     logging.info("Opening gripper before sequence...")
-    control_gripper(gripper_open)
+    # Use simple state API: 0=open, 1=close. Allow numeric override via gripper_open.
+    set_gripper_state(0, gripper_open)
     
     logging.info("Resetting robot to origin...")
     reset(sleep_time, speed)
@@ -909,10 +943,10 @@ def pick_and_place_sequence(positions: List[Tuple[int, List[float]]],
                 # GRIPPER CONTROL based on position
                 if idx == -1:  # After reaching START position
                     logging.info("Closing gripper to pick up object...")
-                    control_gripper(gripper_close)
+                    set_gripper_state(1, gripper_close)
                 elif idx == -2:  # After reaching END position
                     logging.info("Opening gripper to release object...")
-                    control_gripper(gripper_open)
+                    set_gripper_state(0, gripper_open)
                 
                 # Ensure meas_coords is length 6
                 meas_coords = list(meas_coords) + [0.0] * (6 - len(meas_coords))
@@ -1165,6 +1199,12 @@ def main():
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S"
     )
+    # Quiet noisy external libraries (robot telemetry) while keeping our important logs
+    try:
+        logging.getLogger('pymycobot').setLevel(logging.WARNING)
+        logging.getLogger('pymycobot.mycobot').setLevel(logging.WARNING)
+    except Exception:
+        pass
     
     # Update global tolerances if provided
     global COORD_TOLERANCE, ORIENT_TOLERANCE, MAX_RETRIES
@@ -1232,25 +1272,75 @@ def main():
                 logging.info("User cancelled")
                 return 0
     
-    # Build pick-and-place sequence
-    # Sequence: START -> LIFT -> LIFT_TO_END -> END
+    # Build enhanced pick-and-place path
+    # Desired sequence (high level):
+    # 1) HOME (all-zero joints)
+    # 2) ABOVE START (elevated over pick location)
+    # 3) START (pick location) -> close gripper
+    # 4) LIFT (move up from start)
+    # 5) MIDDLE waypoint (safe transit between start and end)
+    # 6) ABOVE END (elevated over place location)
+    # 7) END (place location) -> open gripper
+    # 8) LIFT (move up from end)
+    # 9) HOME (return to all-zero joint pose)
     all_positions = []
-    
-    # 1. Move to start (pick location)
+
+    # 0. Home (compute from origin joint angles)
+    try:
+        origin_joints = list(origin)
+        origin_pos = fk(origin_joints)
+        R_origin = np.array(rot_num(*np.radians(origin_joints)), dtype=float)
+        r_o, p_o, y_o = rotation_matrix_to_euler_zyx(R_origin)
+        origin_coords = [float(origin_pos[0]), float(origin_pos[1]), float(origin_pos[2]),
+                         float(np.degrees(r_o)), float(np.degrees(p_o)), float(np.degrees(y_o))]
+    except Exception:
+        # Fallback: zeros if fk/rot fail
+        origin_coords = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    # Above-start and above-end waypoints
+    above_start = start_coords.copy()
+    above_start[2] = float(above_start[2]) + args.lift_height
+
+    above_end = end_coords.copy()
+    above_end[2] = float(above_end[2]) + args.lift_height
+
+    # Middle waypoint (midpoint in Cartesian space and average orientation)
+    mid_coords = [
+        float((start_coords[0] + end_coords[0]) / 2.0),
+        float((start_coords[1] + end_coords[1]) / 2.0),
+        float((start_coords[2] + end_coords[2]) / 2.0),
+        float((start_coords[3] + end_coords[3]) / 2.0),
+        float((start_coords[4] + end_coords[4]) / 2.0),
+        float((start_coords[5] + end_coords[5]) / 2.0)
+    ]
+
+    # Sequence assembly
+    # 1) Home (all zeros)
+    all_positions.append((-5, origin_coords))
+
+    # 2) Move above start (safe approach)
+    all_positions.append((-3, above_start))
+
+    # 3) Move down to start (pick)
     all_positions.append((-1, start_coords))
-    
-    # 2. Lift from start
-    lift_coords = start_coords.copy()
-    lift_coords[2] += args.lift_height
-    all_positions.append((-3, lift_coords))
-    
-    # 3. Move to end position (elevated)
-    lift_to_end_coords = end_coords.copy()
-    lift_to_end_coords[2] += args.lift_height
-    all_positions.append((-4, lift_to_end_coords))
-    
-    # 4. Lower to end (place location)
+
+    # 4) Lift up from start
+    all_positions.append((-3, above_start))
+
+    # 5) Transit via middle waypoint
+    all_positions.append((-6, mid_coords))
+
+    # 6) Move above end
+    all_positions.append((-4, above_end))
+
+    # 7) Move down to end (place)
     all_positions.append((-2, end_coords))
+
+    # 8) Lift up from end (safe retreat)
+    all_positions.append((-4, above_end))
+
+    # 9) Return home
+    all_positions.append((-5, origin_coords))
     
     logging.info(f"Sequence: START -> CLOSE GRIPPER -> LIFT (+{args.lift_height}mm) -> "
                 f"MOVE_TO_END (+{args.lift_height}mm) -> END -> OPEN GRIPPER")
