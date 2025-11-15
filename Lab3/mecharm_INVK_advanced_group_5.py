@@ -14,6 +14,9 @@ Usage:
   
   # Custom gripper values
   python mecharm_INVK_advanced_group_5.py --output results.csv --positions positions.csv --grip-open 0 --grip-close 80
+  
+  # Test gripper only
+  python mecharm_INVK_advanced_group_5.py --output results.csv --positions positions.csv --test-gripper
 """
 
 import math
@@ -23,7 +26,7 @@ import argparse
 import logging
 import sys
 import threading
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 import numpy as np
 from sympy.matrices import Matrix
 from scipy.optimize import least_squares
@@ -71,7 +74,7 @@ ORIENT_TOLERANCE = 5.0   # Orientation tolerance in degrees
 
 # Gripper settings
 GRIPPER_OPEN = 0      # Gripper fully open (0-100)
-GRIPPER_CLOSE = 100   # Gripper fully closed (0-100)
+GRIPPER_CLOSE = 1   # Gripper fully closed (0-100)
 GRIPPER_SLEEP = 2.0   # Time to wait for gripper action (seconds)
 
 # Speed settings
@@ -614,38 +617,6 @@ def control_gripper(value: int, sleep_time: float = GRIPPER_SLEEP) -> bool:
         return False
 
 
-def set_gripper_state(state: int, value: Optional[int] = None) -> bool:
-    """
-    Set gripper state using a simple 0=open, 1=close interface.
-
-    Args:
-        state: 0 => open, 1 => close
-        value: Optional numeric gripper value (0-100). If provided, this value
-               will be sent to the gripper instead of the configured defaults.
-
-    Returns:
-        True if gripper action succeeded, False otherwise
-    """
-    try:
-        state_int = int(state)
-    except Exception:
-        logging.error("Invalid gripper state (must be 0=open or 1=close)")
-        return False
-
-    if state_int not in (0, 1):
-        logging.error("Invalid gripper state (must be 0=open or 1=close)")
-        return False
-
-    # Use provided numeric value if given, otherwise use defaults
-    if value is not None:
-        return control_gripper(int(value), sleep_time=GRIPPER_SLEEP)
-
-    if state_int == 0:
-        return control_gripper(GRIPPER_OPEN, sleep_time=GRIPPER_SLEEP)
-    else:
-        return control_gripper(GRIPPER_CLOSE, sleep_time=GRIPPER_SLEEP)
-
-
 def get_current_positions() -> Tuple[Optional[List[float]], Optional[List[float]]]:
     """
     Get current joint angles and Cartesian coordinates from robot.
@@ -845,6 +816,8 @@ def pick_and_place_sequence(positions: List[Tuple[int, List[float]]],
     """
     Execute pick-and-place sequence with IK, position verification, and gripper control.
     
+    Uses cached IK solutions for repeated positions (START and END) to avoid recomputation.
+    
     Sequence:
     1. Move to START position (slow speed if precision_mode)
     2. CLOSE gripper (pick up object)
@@ -874,14 +847,16 @@ def pick_and_place_sequence(positions: List[Tuple[int, List[float]]],
     
     # Start with gripper open
     logging.info("Opening gripper before sequence...")
-    # Use simple state API: 0=open, 1=close. Allow numeric override via gripper_open.
-    set_gripper_state(0, gripper_open)
+    control_gripper(gripper_open)
     
     logging.info("Resetting robot to origin...")
     reset(sleep_time, speed)
     logging.info("Robot reset complete")
     
     max_reach = link_lengths(dh_table)
+    
+    # IK solution cache - keyed by position index
+    ik_cache: Dict[int, np.ndarray] = {}
     
     with open(output_csv, mode='w', newline='') as f:
         writer = csv.writer(f)
@@ -903,12 +878,14 @@ def pick_and_place_sequence(positions: List[Tuple[int, List[float]]],
                 position_name = "LIFT"
             elif idx == -4:
                 position_name = "LIFT_TO_END"
+            elif idx == -5:
+                position_name = "HOME"
+            elif idx == -6:
+                position_name = "MIDDLE"
             else:
                 position_name = f"Target {idx}"
             
             x, y, z, rx, ry, rz = target_coords
-            
-            logging.info(f"Computing IK for {position_name}: [{x:.1f}, {y:.1f}, {z:.1f}, {rx:.1f}, {ry:.1f}, {rz:.1f}]")
             
             # Check for pause before IK computation
             check_and_handle_pause()
@@ -921,16 +898,39 @@ def pick_and_place_sequence(positions: List[Tuple[int, List[float]]],
                 current_speed = speed
                 logging.info(f"Using normal speed: {current_speed}")
             
-            get_init_angles, _ = get_current_positions()
-            if get_init_angles is not None:
-                q_init = get_init_angles
-
-            
-            try:
-                # Compute IK solution
-                q_solution = inverse_kinematics(x, y, z, rx, ry, rz, q_init, max_reach)
+            # Check if IK solution is cached
+            if idx in ik_cache:
+                logging.info(f"Using cached IK solution for {position_name}")
+                q_solution = ik_cache[idx]
+            else:
+                logging.info(f"Computing IK for {position_name}: [{x:.1f}, {y:.1f}, {z:.1f}, {rx:.1f}, {ry:.1f}, {rz:.1f}]")
                 
-                # Send to robot with verification (using appropriate speed)
+                # Get current angles for initial guess
+                get_init_angles, _ = get_current_positions()
+                if get_init_angles is not None:
+                    q_init = get_init_angles
+                else:
+                    q_init = origin
+                
+                try:
+                    # Compute IK solution
+                    q_solution = inverse_kinematics(x, y, z, rx, ry, rz, q_init, max_reach)
+                    
+                    # Cache solution for START (-1) and END (-2) positions
+                    if idx in [-1, -2]:
+                        ik_cache[idx] = q_solution
+                        logging.info(f"Cached IK solution for {position_name}")
+                    
+                except Exception as e:
+                    logging.error(f"IK failed for {position_name}: {e}")
+                    check_robot_errors()
+                    # Write row with zeros for failed IK
+                    row = [idx, x, y, z, rx, ry, rz] + [0.0] * 12
+                    writer.writerow(row)
+                    continue
+            
+            # Send to robot with verification
+            try:
                 success, meas_coords = send_angles_with_correction(
                     q_solution.tolist(), target_coords, current_speed, sleep_time, 
                     position_name
@@ -940,13 +940,13 @@ def pick_and_place_sequence(positions: List[Tuple[int, List[float]]],
                     logging.error(f"Failed to reach {position_name}")
                     meas_coords = [0.0] * 6
                 
-                # GRIPPER CONTROL based on position
+                # GRIPPER CONTROL based on position (FIXED)
                 if idx == -1:  # After reaching START position
                     logging.info("Closing gripper to pick up object...")
-                    set_gripper_state(1, gripper_close)
+                    control_gripper(gripper_close)  # ✓ FIXED
                 elif idx == -2:  # After reaching END position
                     logging.info("Opening gripper to release object...")
-                    set_gripper_state(0, gripper_open)
+                    control_gripper(gripper_open)  # ✓ FIXED
                 
                 # Ensure meas_coords is length 6
                 meas_coords = list(meas_coords) + [0.0] * (6 - len(meas_coords))
@@ -964,13 +964,18 @@ def pick_and_place_sequence(positions: List[Tuple[int, List[float]]],
                 logging.info(f"Recorded data for {position_name}")
                 
             except Exception as e:
-                logging.error(f"IK failed for {position_name}: {e}")
+                logging.error(f"Movement failed for {position_name}: {e}")
                 check_robot_errors()
-                # Write row with zeros for failed IK
-                row = [idx, x, y, z, rx, ry, rz] + [0.0] * 12
+                # Write row with computed angles but failed movement
+                row = [
+                    idx, x, y, z, rx, ry, rz,
+                    q_solution[0], q_solution[1], q_solution[2], 
+                    q_solution[3], q_solution[4], q_solution[5]
+                ] + [0.0] * 6
                 writer.writerow(row)
     
     logging.info(f"Sequence complete. Results: {output_csv}")
+    logging.info(f"IK cache statistics: {len(ik_cache)} positions cached")
     
     # Final status check
     if not verify_robot_status():
@@ -978,6 +983,39 @@ def pick_and_place_sequence(positions: List[Tuple[int, List[float]]],
     
     # Check for any final errors
     check_robot_errors()
+
+
+def test_gripper():
+    """Test gripper open/close cycle independently"""
+    if mc is None:
+        print("❌ Robot not initialized")
+        return False
+    
+    print("\n" + "="*60)
+    print("  GRIPPER TEST MODE")
+    print("="*60)
+    
+    try:
+        print("Testing gripper...")
+        print("1. Opening gripper...")
+        control_gripper(0)  # Open
+        time.sleep(2)
+        
+        print("2. Closing gripper...")
+        control_gripper(100)  # Close
+        time.sleep(2)
+        
+        print("3. Opening gripper...")
+        control_gripper(0)  # Open
+        time.sleep(1)
+        
+        print("✓ Gripper test complete")
+        print("="*60 + "\n")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Gripper test failed: {e}")
+        return False
 
 
 def parse_position(pos_str: str) -> List[float]:
@@ -1156,6 +1194,9 @@ Examples:
   
   # Custom lift height
   %(prog)s --output results.csv --positions positions.csv --lift-height 80
+  
+  # Test gripper only
+  %(prog)s --output results.csv --positions positions.csv --test-gripper
         """
     )
     p.add_argument("--output", "-o", required=True, 
@@ -1164,7 +1205,9 @@ Examples:
                    help="CSV file for start/end positions (read or write)")
     p.add_argument("--manual", action="store_true",
                    help="Manual mode: physically move robot to record positions")
-    p.add_argument("--lift-height", type=float, default=50.0, 
+    p.add_argument("--test-gripper", action="store_true",
+                   help="Test gripper open/close cycle and exit")
+    p.add_argument("--lift-height", type=float, default=150.0, 
                    help="Lift height above pick/place positions in mm (default: 50)")
     p.add_argument("--speed", type=int, default=30, 
                    help="Robot movement speed 0-100 (default: 30)")
@@ -1196,7 +1239,7 @@ def main():
     # Configure logging
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
+        format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S"
     )
     # Quiet noisy external libraries (robot telemetry) while keeping our important logs
@@ -1216,6 +1259,11 @@ def main():
     if not init_robot(dry_run=False):
         logging.error("Failed to initialize robot")
         return 1
+    
+    # TEST GRIPPER MODE
+    if args.test_gripper:
+        success = test_gripper()
+        return 0 if success else 1
     
     # MANUAL MODE: Record positions by moving robot
     if args.manual:
@@ -1273,16 +1321,6 @@ def main():
                 return 0
     
     # Build enhanced pick-and-place path
-    # Desired sequence (high level):
-    # 1) HOME (all-zero joints)
-    # 2) ABOVE START (elevated over pick location)
-    # 3) START (pick location) -> close gripper
-    # 4) LIFT (move up from start)
-    # 5) MIDDLE waypoint (safe transit between start and end)
-    # 6) ABOVE END (elevated over place location)
-    # 7) END (place location) -> open gripper
-    # 8) LIFT (move up from end)
-    # 9) HOME (return to all-zero joint pose)
     all_positions = []
 
     # 0. Home (compute from origin joint angles)
@@ -1354,7 +1392,7 @@ def main():
             sleep_time=args.sleep,
             gripper_open=args.grip_open,
             gripper_close=args.grip_close,
-            precision_mode=not args.no_precision
+            precision_mode=not args.no_precision  # ✓ FIXED
         )
         logging.info("Sequence completed successfully")
         return 0
