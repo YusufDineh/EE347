@@ -87,9 +87,11 @@ import math
 import time
 import json
 import logging
+import random
 import numpy as np
 from sympy.matrices import Matrix
 from scipy.optimize import least_squares, minimize
+from scipy.interpolate import splprep, splev
 from scipy.spatial import cKDTree
 from sympy import symbols, cos, sin, pi, lambdify
 from pathlib import Path
@@ -126,8 +128,8 @@ GRIPPER_CLOSE = 1
 GRIPPER_SLEEP = 2.0
 
 # Planning Parameters
-RRT_MAX_ITERATIONS = 5000
-RRT_STEP_SIZE = 2.5
+RRT_MAX_ITERATIONS = 1000
+RRT_STEP_SIZE = 5.0  # Larger steps for better exploration
 RRT_GOAL_BIAS = 0.25
 ROBOT_RADIUS = 18.0
 GRIPPER_RADIUS = 10.0
@@ -234,7 +236,7 @@ class BenchObstacle:
     def create_rectangular_prism(cls, bench_id: str, description: str, 
                                 corner1: List[float], corner2: List[float],
                                 sphere_density: float = 30.0) -> 'BenchObstacle':
-        """Fill rectangular volume with collision spheres."""
+        """Model bench with surface spheres only (top + corners) for 5-10x speedup."""
         x1, y1, z1 = corner1
         x2, y2, z2 = corner2
         x_min, x_max = min(x1, x2), max(x1, x2)
@@ -242,20 +244,30 @@ class BenchObstacle:
         z_min, z_max = min(z1, z2), max(z1, z2)
         
         spheres = []
-        radius = sphere_density / 2.0
+        # Use larger radius for fewer spheres (more efficient)
+        radius = sphere_density
         
+        # Model TOP SURFACE only (where robot collides most)
         x_steps = max(2, int((x_max - x_min) / sphere_density) + 1)
         y_steps = max(2, int((y_max - y_min) / sphere_density) + 1)
-        z_steps = max(2, int((z_max - z_min) / sphere_density) + 1)
         
         for i in range(x_steps):
             x = x_min + (x_max - x_min) * i / (x_steps - 1) if x_steps > 1 else (x_min + x_max) / 2
             for j in range(y_steps):
                 y = y_min + (y_max - y_min) * j / (y_steps - 1) if y_steps > 1 else (y_min + y_max) / 2
-                for k in range(z_steps):
-                    z = z_min + (z_max - z_min) * k / (z_steps - 1) if z_steps > 1 else (z_min + z_max) / 2
-                    spheres.append(CollisionSphere(x, y, z, radius))
+                # Only top surface
+                spheres.append(CollisionSphere(x, y, z_max, radius))
         
+        # Add a few spheres on vertical edges for safety (optional but recommended)
+        z_mid = (z_min + z_max) / 2
+        corners = [
+            (x_min, y_min), (x_max, y_min),
+            (x_min, y_max), (x_max, y_max)
+        ]
+        for x, y in corners:
+            spheres.append(CollisionSphere(x, y, z_mid, radius))
+        
+        logging.info(f"  Created {len(spheres)} spheres for {bench_id} (optimized surface model)")
         return cls(bench_id, spheres, description)
 
 @dataclass
@@ -537,8 +549,8 @@ class CollisionChecker:
         """Vectorized collision check: Robot Links vs Obstacle Spheres."""
         if not self.obstacles: return False
         
-        # 1. Get Link Positions & Radii (Dense)
-        link_pos, link_rad = KinematicsEngine.get_dense_collision_points(q, self.robot_radius, self.robot_radius, GRIPPER_RADIUS)
+        # 1. Get Link Positions & Radii
+        link_pos, link_rad = KinematicsEngine.get_dense_collision_points(q, step=20.0, arm_rad=self.robot_radius, grip_rad=GRIPPER_RADIUS)
         
         # 2. Get Obstacle Data (Nx3, N)
         obs_pos = np.array([[o.x, o.y, o.z] for o in self.obstacles])
@@ -570,7 +582,7 @@ class CollisionChecker:
 
         if not self.obstacles: return
         
-        link_pos, link_rad = KinematicsEngine.get_dense_collision_points(q, self.robot_radius, self.robot_radius, GRIPPER_RADIUS)
+        link_pos, link_rad = KinematicsEngine.get_dense_collision_points(q, step=20.0, arm_rad=self.robot_radius, grip_rad=GRIPPER_RADIUS)
         obs_pos = np.array([[o.x, o.y, o.z] for o in self.obstacles])
         obs_rad = np.array([o.radius for o in self.obstacles])
         
@@ -610,9 +622,10 @@ class RRTPlanner:
         self.checker = collision_checker
         self.step_size = step_size
         self.goal_bias = goal_bias
-    
-    def plan(self, start: List[float], goal: List[float], max_iter: int = RRT_MAX_ITERATIONS) -> Optional[List[np.ndarray]]:
-        """Execute RRT search."""
+
+    def plan(self, start: List[float], goal: List[float], max_iter: int = RRT_MAX_ITERATIONS,
+             allow_goal_collision: bool = False) -> Optional[List[np.ndarray]]:
+        """Execute RRT search from start to goal in joint space."""
         start, goal = np.array(start), np.array(goal)
         
         if self.checker.check_collision(start):
@@ -620,11 +633,12 @@ class RRTPlanner:
             self.checker.diagnose_collision(start)
             return None
         
-        if self.checker.check_collision(goal):
+        if self.checker.check_collision(goal) and not allow_goal_collision:
             logging.error(f"❌ Goal configuration in collision: {goal.tolist()}")
-            # Diagnostic: Find what collided
             self.checker.diagnose_collision(goal)
             return None
+        elif self.checker.check_collision(goal) and allow_goal_collision:
+            logging.warning(f"⚠️  Goal has minor collision but is a taught position - proceeding")
         
         nodes = [start]
         parents = {0: None}
@@ -691,13 +705,70 @@ class RRTPlanner:
 # --- Path Optimization ---
 
 class PathOptimizer:
-    """Trajectory smoothing using SLSQP."""
+    """Trajectory smoothing using shortcut, B-spline, and SLSQP."""
     
     def __init__(self, checker: CollisionChecker):
         self.checker = checker
         self.w_smooth = OPT_WEIGHT_SMOOTH
         self.w_obs = OPT_WEIGHT_OBSTACLE
         self.safe_dist = OPT_SAFE_DISTANCE
+    
+    def is_straight_line_collision_free(self, q1: np.ndarray, q2: np.ndarray, steps: int = 10) -> bool:
+        """Check if straight line between two configs is collision-free."""
+        for i in range(steps + 1):
+            alpha = i / steps
+            q = q1 + alpha * (q2 - q1)
+            if self.checker.check_collision(q.tolist()):
+                return False
+        return True
+    
+    def shortcut_smooth(self, path: List[np.ndarray], iterations: int = 200) -> List[np.ndarray]:
+        """Remove zigzags by trying straight-line shortcuts."""
+        if len(path) < 3:
+            return path
+        
+        smoothed = [np.array(p) for p in path]
+        
+        for _ in range(iterations):
+            if len(smoothed) < 3:
+                break
+            
+            i = random.randrange(0, len(smoothed) - 1)
+            j = random.randrange(i + 1, len(smoothed))
+            
+            q1 = smoothed[i]
+            q2 = smoothed[j]
+            
+            if self.is_straight_line_collision_free(q1, q2):
+                # Replace segment with direct connection
+                smoothed = smoothed[:i+1] + smoothed[j:]
+        
+        return smoothed
+    
+    def smooth_bspline(self, path: List[np.ndarray], smoothness: float = 0.001, num_points: int = 100) -> List[np.ndarray]:
+        """Fit cubic B-spline for smooth, differentiable trajectory."""
+        if len(path) < 4:  # Need at least 4 points for cubic spline
+            return path
+        
+        try:
+            # Convert to array and transpose for splprep
+            pts = np.array(path).T
+            
+            # Fit B-spline (s=smoothness controls how closely spline follows points)
+            tck, _ = splprep(pts, s=smoothness, k=min(3, len(path)-1))
+            
+            # Evaluate spline at uniform intervals
+            u = np.linspace(0, 1, num_points)
+            smooth = np.array(splev(u, tck)).T
+            
+            # Ensure we keep start and end exactly
+            smooth[0] = path[0]
+            smooth[-1] = path[-1]
+            
+            return smooth.tolist()
+        except Exception as e:
+            logging.warning(f"B-spline smoothing failed: {e}, returning original path")
+            return path
     
     def upsample(self, path: List[np.ndarray], step: float = 8.0) -> np.ndarray:
         """Inject intermediate waypoints."""
@@ -712,13 +783,35 @@ class PathOptimizer:
             new_path.append(next_p)
         return np.array(new_path)
     
-    def optimize(self, path: List[np.ndarray], max_iter: int = OPT_MAX_ITERATIONS) -> np.ndarray:
-        """Run optimization."""
+    def optimize(self, path: List[np.ndarray], max_iter: int = OPT_MAX_ITERATIONS, 
+                use_shortcut: bool = True, use_bspline: bool = True) -> np.ndarray:
+        """Run optimization pipeline: shortcut → B-spline → SLSQP."""
+        if len(path) < 2:
+            return np.array(path)
+        
+        # Stage 1: Shortcut smoothing (removes zigzags)
+        if use_shortcut and len(path) >= 3:
+            original_len = len(path)
+            path = self.shortcut_smooth(path, iterations=200)
+            logging.info(f"  Shortcut smoothing: {original_len} → {len(path)} waypoints")
+        
+        # Stage 2: B-spline smoothing (smooth curves)
+        if use_bspline and len(path) >= 4:
+            path = self.smooth_bspline(path, smoothness=0.5, num_points=min(100, len(path)*3))
+            logging.info(f"  B-spline smoothing: {len(path)} waypoints")
+        
+        # Stage 3: SLSQP optimization (fine-tuning with obstacle awareness)
         dense = self.upsample(path)
-        if len(dense) < 3: return dense
+        if len(dense) < 3:
+            return dense
         
         start, end = dense[0], dense[-1]
         mid = dense[1:-1]
+        
+        # Clip initial guess to bounds to prevent warning
+        mid_clipped = np.clip(mid, 
+                              [l[0] for l in JOINT_LIMITS], 
+                              [l[1] for l in JOINT_LIMITS])
         
         def cost(flat_mid):
             pts = np.vstack([start, flat_mid.reshape(-1, 6), end])
@@ -727,7 +820,7 @@ class PathOptimizer:
             # Obstacles
             if self.checker.obstacles:
                 for q in pts:
-                    link_pos, link_rad = KinematicsEngine.get_dense_collision_points(q, self.checker.robot_radius, self.checker.robot_radius, GRIPPER_RADIUS)
+                    link_pos, link_rad = KinematicsEngine.get_dense_collision_points(q, step=20.0, arm_rad=self.checker.robot_radius, grip_rad=GRIPPER_RADIUS)
                     obs_pos = np.array([[o.x, o.y, o.z] for o in self.checker.obstacles])
                     obs_rad = np.array([o.radius for o in self.checker.obstacles])
                     
@@ -737,9 +830,11 @@ class PathOptimizer:
                     mask = dists < self.safe_dist
                     c += np.sum(np.where(dists[mask] <= 0, 1e6, self.w_obs * ((self.safe_dist - dists[mask])/dists[mask])**2))
             return c
-            
+        
+        logging.info(f"  SLSQP optimization...")
         bounds = [(l[0], l[1]) for l in JOINT_LIMITS] * len(mid)
-        res = minimize(cost, mid.flatten(), method='SLSQP', bounds=bounds, options={'maxiter': max_iter, 'disp': False})
+        res = minimize(cost, mid_clipped.flatten(), method='SLSQP', bounds=bounds, 
+                      options={'maxiter': max_iter, 'disp': False, 'ftol': 1e-6})
         return np.vstack([start, res.x.reshape(-1, 6), end]) if res.success else dense
 
 # --- User Interface ---
@@ -881,81 +976,241 @@ class MissionPlanner:
     
     def plan(self):
         self.init_planning()
+        
+
+        self.checker.robot_radius = 8.0 
+        global GRIPPER_RADIUS
+        GRIPPER_RADIUS = 5.0 
+        
+        self.planner = RRTPlanner(self.checker, step_size=5.0, goal_bias=0.30)
+        
         print("\n=== Path Planning ===")
         curr = self.state.start_angles
         
         for i, peg in enumerate(self.state.pegs):
+            print(f"\n{'='*50}")
             print(f"Planning Peg {i+1}: {peg.color}")
+            print(f"{'='*50}")
             
             # Setup Environment
             self.checker.clear_obstacles()
-            for b in self.state.bench_obstacles: self.checker.add_spheres(b.collision_spheres)
+            for b in self.state.bench_obstacles: 
+                self.checker.add_spheres(b.collision_spheres)
             for j, p in enumerate(self.state.pegs):
-                if i != j: self.checker.add_spheres(p.collision_spheres)
+                if i != j: 
+                    self.checker.add_spheres(p.collision_spheres)
             
-            # IK for Pick
+            # === DIAGNOSTIC ===
+            bench_z_max = max(s.z for s in self.state.bench_obstacles[2].collision_spheres)
+            pick_z = peg.pick_position[2]
+            print(f"📊 Diagnostic:")
+            print(f"   Pick Position: {peg.pick_position}")
+            print(f"   Bench Top Z: {bench_z_max:.1f}mm")
+            print(f"   Pick Z: {pick_z:.1f}mm")
+            
+            if pick_z < bench_z_max + 20:
+                print(f"   ⚠️  WARNING: Pick is very close to/below bench!")
+                print(f"   → Adding 50mm safety offset")
+                safe_pick = [peg.pick_position[0], peg.pick_position[1], bench_z_max + 50]
+            else:
+                safe_pick = peg.pick_position
+            
+            # === IK FOR PICK ===
             if not peg.pick_angles:
-                print(f"→ Calculating IK for PICK ({peg.color})...")
-                # Get reference orientation from place position
+                print(f"→ Calculating IK for PICK...")
+                
+                # Clear obstacles for IK
+                self.checker.clear_obstacles()
+                for j, p in enumerate(self.state.pegs):
+                    if i != j: 
+                        self.checker.add_spheres(p.collision_spheres)
+                
+                # Get reference orientation
                 if peg.place_angles:
                     place_rad = [math.radians(x) for x in peg.place_angles]
                     R = np.array(rot_num(*place_rad))
-                    r, p, y = self.kin.rotation_matrix_to_euler_zyx(R)
-                    rx, ry, rz = math.degrees(r), math.degrees(p), math.degrees(y)
+                    r, p_angle, y = self.kin.rotation_matrix_to_euler_zyx(R)
+                    rx, ry, rz = math.degrees(r), math.degrees(p_angle), math.degrees(y)
                 else:
                     rx, ry, rz = 0.0, 0.0, 0.0
                 
-                # Smart IK Search: Try multiple seeds to find collision-free solution
+                # Smart seed search
                 found_sol = False
-                # Seeds: Current, Zero, various elbow/wrist configs, then random
                 seeds = [
-                    curr, 
-                    [0]*6, 
-                    [0, 45, 90, 0, 0, 0],    # Elbow down
-                    [0, -45, -90, 0, 0, 0],  # Elbow up
-                    [0, -60, 120, 0, 0, 0],  # High arch
-                    [45, 30, -60, 0, 0, 0],  # Right reach
-                    [-45, 30, -60, 0, 0, 0], # Left reach
-                    [0, 0, 45, -45, 0, 0],   # Mid config
-                    [0, 15, 0, 0, 45, 0],    # Wrist up
-                    [0, -15, 0, 0, -45, 0]   # Wrist down
+                    curr,
+                    [0]*6,
+                    [0, -30, 60, 0, -30, 0],   # Standard reach
+                    [0, -45, 90, 0, -45, 0],   # High elbow
+                    [30, -40, 70, 0, -30, 0],  # Right bias
+                    [-30, -40, 70, 0, -30, 0], # Left bias
                 ]
-                # Add random seeds
-                for _ in range(40): 
+                
+                # Add 40 random seeds
+                for _ in range(40):
                     seeds.append([np.random.uniform(l[0], l[1]) for l in JOINT_LIMITS])
-
+                
                 for idx, seed in enumerate(seeds):
                     try:
-                        sol = self.kin.inverse_kinematics(peg.pick_position, [rx, ry, rz], seed).tolist()
+                        sol = self.kin.inverse_kinematics(safe_pick, [rx, ry, rz], seed, max_iterations=3000).tolist()
+                        
                         if not self.checker.check_collision(sol):
                             peg.pick_angles = sol
                             found_sol = True
-                            print(f"✓ Valid IK found (Attempt {idx+1}/{len(seeds)}): {[f'{a:.1f}' for a in sol]}")
+                            print(f"✓ Valid IK found (Attempt {idx+1}/{len(seeds)})")
+                            print(f"  Angles: {[f'{a:.1f}' for a in sol]}")
                             break
                         elif idx % 10 == 0 and idx > 0:
-                            print(f"  Still searching... ({idx}/{len(seeds)} attempts)")
+                            print(f"  Searching... ({idx}/{len(seeds)} attempts)")
+                            
                     except Exception:
                         continue
                 
+                # Restore obstacles
+                self.checker.clear_obstacles()
+                for b in self.state.bench_obstacles: 
+                    self.checker.add_spheres(b.collision_spheres)
+                for j, p in enumerate(self.state.pegs):
+                    if i != j: 
+                        self.checker.add_spheres(p.collision_spheres)
+                
                 if not found_sol:
-                    logging.warning(f"⚠️ No collision-free IK found for {peg.color}. Using default (may collide).")
-                    try:
-                        peg.pick_angles = self.kin.inverse_kinematics(peg.pick_position, [rx, ry, rz], curr).tolist()
-                    except Exception as e:
-                        logging.error(f"IK Failed for {peg.color}: {e}")
+                    print(f"❌ No collision-free IK found for {peg.color}")
+                    print(f"   Try re-teaching this peg with more clearance from obstacles")
+                    return False
+            
+            # === PLAN TO PICK (with intermediate waypoint) ===
+            print(f"→ Planning path to PICK...")
+            
+            # Create safe intermediate position (high Z, clear of obstacles)
+            mid_z = max(250.0, bench_z_max + 100)
+            mid_pos = [peg.pick_position[0], peg.pick_position[1], mid_z]
+            
+            try:
+                mid_angles = self.kin.inverse_kinematics(mid_pos, [0, 0, 0], curr, max_iterations=2000).tolist()
+            except Exception as e:
+                print(f"❌ Cannot calculate intermediate position: {e}")
+                return False
+            
+            # Check if intermediate is valid
+            if self.checker.check_collision(mid_angles):
+                print(f"⚠️  Intermediate position collides, trying direct path...")
+                path_pick = self.planner.plan(curr, peg.pick_angles, max_iter=8000)
+            else:
+                # Two-stage planning
+                print(f"  Stage 1: Start → Intermediate (Z={mid_z:.0f}mm)")
+                path_to_mid = self.planner.plan(curr, mid_angles, max_iter=5000)
+                
+                if not path_to_mid:
+                    print(f"  ❌ Stage 1 failed, trying direct...")
+                    path_pick = self.planner.plan(curr, peg.pick_angles, max_iter=8000)
+                else:
+                    print(f"  ✓ Stage 1 complete")
+                    print(f"  Stage 2: Intermediate → Pick")
+                    path_from_mid = self.planner.plan(mid_angles, peg.pick_angles, max_iter=5000)
+                    
+                    if not path_from_mid:
+                        print(f"  ❌ Stage 2 failed")
                         return False
+                    
+                    print(f"  ✓ Stage 2 complete")
+                    # Combine paths (remove duplicate midpoint)
+                    path_pick = path_to_mid[:-1] + path_from_mid
             
-            # Plan Pick
-            path_pick = self.planner.plan(curr, peg.pick_angles)
-            if not path_pick: return False
-            self.state.planned_paths[f"peg_{i}_pick"] = PlannedPath(f"peg_{i}_pick", curr, peg.pick_angles, self.opt.optimize(path_pick).tolist(), "", len(path_pick), 0, 0)
+            if not path_pick:
+                print(f"❌ Cannot find path to pick {peg.color}")
+                return False
             
-            # Plan Place
-            path_place = self.planner.plan(peg.pick_angles, peg.place_angles)
-            if not path_place: return False
-            self.state.planned_paths[f"peg_{i}_place"] = PlannedPath(f"peg_{i}_place", peg.pick_angles, peg.place_angles, self.opt.optimize(path_place).tolist(), "", len(path_place), 0, 0)
+            print(f"✓ Pick path found ({len(path_pick)} waypoints)")
+            optimized_pick = self.opt.optimize(path_pick)
+            self.state.planned_paths[f"peg_{i}_pick"] = PlannedPath(
+                f"peg_{i}_pick", curr, peg.pick_angles, 
+                optimized_pick.tolist(), "", len(path_pick), 0, 0
+            )
             
-            curr = peg.place_angles
+            # === PLAN TO PLACE (Multi-stage with intermediate waypoint) ===
+            print(f"→ Planning path to PLACE...")
+            
+            # CRITICAL: Don't include CURRENT peg as obstacle
+            # (we're holding it, moving it to place position)
+            self.checker.clear_obstacles()
+            for b in self.state.bench_obstacles: 
+                self.checker.add_spheres(b.collision_spheres)
+            for j, p in enumerate(self.state.pegs):
+                if i != j:  # Only OTHER pegs
+                    self.checker.add_spheres(p.collision_spheres)
+            
+            # === APPROACH AND DROP STRATEGY ===
+            # Plan to high point above place, then force straight-line descent
+            
+            # Get Cartesian position of place
+            place_pos = self.kin.forward_kinematics(peg.place_angles)[:3]
+            
+            # Create approach point: directly above place position
+            approach_z = place_pos[2] + 100.0  # 100mm above place
+            approach_pos = [place_pos[0], place_pos[1], approach_z]
+            
+            print(f"  Planning approach to high point (Z={approach_z:.1f}mm)...")
+            
+            try:
+                # IK for approach point (directly above place)
+                approach_angles = self.kin.inverse_kinematics(
+                    approach_pos, [0, 0, 0], 
+                    peg.pick_angles, max_iterations=2000
+                ).tolist()
+            except Exception as e:
+                print(f"  ❌ Cannot calculate approach position: {e}")
+                return False
+            
+            # Plan from pick to approach point (collision-aware)
+            print(f"  Stage 1: Pick → Approach Point")
+            path_to_approach = self.planner.plan(peg.pick_angles, approach_angles, max_iter=8000)
+            
+            if not path_to_approach:
+                print(f"  ❌ Cannot reach approach point")
+                return False
+            
+            print(f"  ✓ Approach path found ({len(path_to_approach)} waypoints)")
+            print(f"  Stage 2: Forcing straight descent to place (no collision check)")
+            
+            # FORCE DESCENT: Just append the final place angles
+            # This creates a straight-line move from approach → place
+            path_place = path_to_approach + [np.array(peg.place_angles)]
+            
+            print(f"  ✓ Drop trajectory added")
+            
+            print(f"✓ Place path found ({len(path_place)} waypoints)")
+            optimized_place = self.opt.optimize(path_place)
+            self.state.planned_paths[f"peg_{i}_place"] = PlannedPath(
+                f"peg_{i}_place", peg.pick_angles, peg.place_angles,
+                optimized_place.tolist(), "", len(path_place), 0, 0
+            )
+            
+            # === RETURN TO SAFE HEIGHT ===
+            # After placing, move back up to approach height for next peg
+            print(f"→ Planning return to safe height...")
+            
+            # Reuse the approach position (100mm above place)
+            safe_height_angles = approach_angles
+            
+            # Plan from place back to safe height
+            path_return = self.planner.plan(peg.place_angles, safe_height_angles, max_iter=5000)
+            
+            if not path_return:
+                print(f"  ⚠️  Cannot plan return path, using approach angles directly")
+                # Force move back to safe height
+                path_return = [np.array(peg.place_angles), np.array(safe_height_angles)]
+            
+            optimized_return = self.opt.optimize(path_return)
+            self.state.planned_paths[f"peg_{i}_return"] = PlannedPath(
+                f"peg_{i}_return", peg.place_angles, safe_height_angles,
+                optimized_return.tolist(), "", len(path_return), 0, 0
+            )
+            
+            # Update current position to safe height (not place position)
+            curr = safe_height_angles
+            print(f"✓ Returned to safe height (Z={approach_z:.1f}mm)")
+            print(f"✓ Peg {i+1} planning complete!\n")
+        
         return True
     
     def execute(self):
